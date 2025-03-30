@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -41,6 +42,30 @@ type MachineConfig struct {
 	MACAddress   string   `yaml:"macaddress"`
 	Location     string   `yaml:"location"`
 	Tags         []string `yaml:"tags"`
+	CloudInit    string   `yaml:"cloudinit"`
+	RootUsername string   `yaml:"rootusername"`
+	ISO          string   `yaml:"iso"`
+}
+
+func (c *MachineConfig) GetIPFromLogFile() string {
+	logFile := filepath.Join(c.Location, "alpine.log")
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		return ""
+	}
+
+	// Look for DHCP lease information in logs
+	logContent := string(data)
+
+	// Regular expression to extract the IP from the "offered" line
+	re := regexp.MustCompile(`eth0: offered (\d+\.\d+\.\d+\.\d+)`)
+	matches := re.FindStringSubmatch(logContent)
+
+	if len(matches) >= 2 {
+		return matches[1] // Return the captured IP address
+	}
+
+	return ""
 }
 
 // Exec starts an interactive shell terminal in VM
@@ -54,8 +79,8 @@ func (c *MachineConfig) Exec(cmd string, root bool) (string, error) {
 		if ip == "localhost" || ip == "" {
 			log.Println("getting instance IP address from DHCP leases")
 
-			for {
-				ip = c.GetIPAddressByMac()
+			for i := 0; i < 10; i++ {
+				ip = c.GetIPFromLogFile()
 				//ip = c.GetIPAddressFromMachine()
 				if ip != "" {
 					break
@@ -63,6 +88,12 @@ func (c *MachineConfig) Exec(cmd string, root bool) (string, error) {
 				fmt.Print(".")
 				time.Sleep(4 * time.Second)
 			}
+
+			if ip == "" {
+				return "", errors.New("failed to get IP address from DHCP leases")
+			}
+
+			fmt.Println("GOT IT: ", ip)
 
 			c.MachineIP = ip
 			config, err := yaml.Marshal(&c)
@@ -87,8 +118,13 @@ func (c *MachineConfig) Exec(cmd string, root bool) (string, error) {
 	user := c.SSHUser
 	pwd := c.SSHPassword
 
-	if root && user != "root" {
-		user = "root"
+	// if root && user != "root" {
+	if root {
+		if c.RootUsername == "" {
+			user = "root"
+		} else {
+			user = c.RootUsername
+		}
 		if c.RootPassword == nil {
 			pwd = "root"
 		} else {
@@ -128,19 +164,36 @@ func (c *MachineConfig) Exec(cmd string, root bool) (string, error) {
 
 	var conn *ssh.Client
 
-	for i := 0; i < 11; i++ {
+	for i := 0; i < 1111; i++ {
 		conn, err = ssh.Dial("tcp", host, conf)
 
 		if err == nil {
 			break
 		}
-		if i == 10 {
+		if i == 1110 {
 			return "", err
 		}
 
-		fmt.Print(".")
-		time.Sleep(4 * time.Second)
+		perr := err.Error()
 
+		// check the log file for "Welcome to Alpine Linux"
+		logFile := filepath.Join(c.Location, "alpine.log")
+		data, err := os.ReadFile(logFile)
+		if err != nil {
+			return "", err
+		}
+		logContent := string(data)
+		if strings.Contains(logContent, "Welcome to Alpine Linux") {
+			break
+		}
+
+		fmt.Println("waiting for ssh connection [", i, "]: ", perr)
+		time.Sleep(1 * time.Second)
+
+	}
+
+	if conn == nil {
+		return "", errors.New("failed to connect to " + host)
 	}
 	defer conn.Close()
 
@@ -461,9 +514,18 @@ func (c *MachineConfig) Start() error {
 		highmem = "on"
 	}
 
-	aarch64Args := []string{
-		"-M", "virt,highmem=" + highmem,
-		"-bios", filepath.Join(c.Location, "qemu_efi.fd"),
+	aarch64Args := []string{}
+
+	if c.CloudInit != "" {
+		aarch64Args = append(aarch64Args, []string{
+			"-M", "virt,highmem=" + highmem,
+			"-bios", fmt.Sprintf("/opt/homebrew/share/qemu/edk2-%s-code.fd", c.Arch),
+		}...)
+	} else {
+		aarch64Args = append(aarch64Args, []string{
+			"-M", "virt,highmem=" + highmem,
+			"-bios", filepath.Join(c.Location, "qemu_efi.fd"),
+		}...)
 	}
 
 	x86Args := []string{
@@ -473,6 +535,10 @@ func (c *MachineConfig) Start() error {
 
 	mountArgs := []string{"-fsdev", "local,path=" + c.Mount + ",security_model=mapped-xattr,id=host0",
 		"-device", "virtio-9p-pci,fsdev=host0,mount_tag=host0"}
+
+	// efi="/opt/homebrew/share/qemu/edk2-${qemu_arch}-code.fd"
+	// machine="virt,accel=hvf,highmem=on"
+	// nic="vmnet-shared,start-address=192.168.1.1,end-address=192.168.1.20,subnet-mask=255.255.255.0"
 
 	commonArgs := []string{
 		"-m", c.Memory,
@@ -506,7 +572,14 @@ func (c *MachineConfig) Start() error {
 		qemuArgs = append(qemuArgs, mountArgs...)
 	}
 
-	cmd := exec.Command(qemuCmd, qemuArgs...)
+	if c.ISO != "" {
+		qemuArgs = append(qemuArgs, "-drive", "file="+c.ISO+",driver=raw,if=virtio")
+		// qemuArgs = append(qemuArgs, "-nic", "vmnet-shared,start-address=192.168.1.1,end-address=192.168.1.20,subnet-mask=255.255.255.0,mac="+c.MACAddress)
+	}
+
+	withCmd := append([]string{qemuCmd}, qemuArgs...)
+
+	cmd := exec.Command("sudo", withCmd...)
 
 	cmd.Stdout = os.Stdout
 
@@ -514,6 +587,8 @@ func (c *MachineConfig) Start() error {
 	cmd.Stderr = os.Stderr
 
 	log.Println("booting " + c.Alias)
+
+	fmt.Println(cmd.String())
 	err = cmd.Run()
 	if err != nil {
 		c.Stop()
@@ -604,10 +679,19 @@ func (c *MachineConfig) GetIPAddressByMac() string {
 
 		// Check if the line contains a MAC address
 		if strings.Contains(line, "hw_address") {
-			mac = strings.Split(strings.Fields(line)[0], "hw_address=1,")[1]
+			// fmt.Println("line: ", strings.Fields(line))
+			// mac = strings.Split(strings.Fields(line)[0], "hw_address=1,")[1]
+			regex := regexp.MustCompile(`hw_address=(\S+),(\S+)`)
+			matches := regex.FindStringSubmatch(line)
+			if len(matches) == 3 {
+				mac = matches[2]
+			}
+
+			// fmt.Println("mac: ", c.MACAddress, mac, ip)
 		}
 
 		if mac == c.MACAddress {
+			fmt.Println("GOTIT: ", c.MACAddress, mac, ip)
 			return ip
 		}
 
@@ -634,7 +718,12 @@ func (c *MachineConfig) Launch() error {
 		return err
 	}
 
-	imageURL := utils.GetImageURL(c.Image)
+	var imageURL string
+	if c.CloudInit != "" {
+		imageURL = utils.GetImageURLCloud(c.Image)
+	} else {
+		imageURL = utils.GetImageURL(c.Image)
+	}
 
 	if _, err := os.Stat(filepath.Join(cacheDir, c.Image)); errors.Is(err, os.ErrNotExist) {
 		err = utils.DownloadFile(filepath.Join(cacheDir, c.Image), imageURL)
@@ -671,6 +760,7 @@ func (c *MachineConfig) Launch() error {
 			os.RemoveAll(targetDir)
 			return err
 		}
+
 	}
 
 	err = c.ResizeQemuDiskImage()
@@ -686,10 +776,70 @@ func (c *MachineConfig) Launch() error {
 		return err
 	}
 
+	if c.CloudInit != "" {
+		_, err = utils.CopyFile(c.CloudInit, filepath.Join(c.Location, "user-data"))
+		if err != nil {
+			os.RemoveAll(targetDir)
+			return err
+		}
+	}
+
 	err = os.WriteFile(filepath.Join(c.Location, "config.yaml"), config, 0644)
 	if err != nil {
 		os.RemoveAll(targetDir)
 		return err
+	}
+
+	if c.CloudInit != "" {
+
+		metadata := `instance-id: %s
+local-hostname: %s
+`
+
+		network := `version: 2
+ethernets:
+  eth0:
+    dhcp4: true
+    dhcp6: true
+    optional: true
+    nameservers:
+      addresses: [8.8.8.8, 8.8.4.4]
+    dhcp4-overrides:
+      send-hostname: true
+      use-hostname: true
+      use-mtu: true
+    routes:
+      - to: 0.0.0.0/0
+        via: 10.0.2.2
+        metric: 100
+`
+
+		// create meta-data file
+		metaData := fmt.Sprintf(metadata, c.Alias, c.Alias)
+		err = os.WriteFile(filepath.Join(c.Location, "meta-data"), []byte(metaData), 0644)
+		if err != nil {
+			return errors.New("unable to create meta-data file: " + err.Error())
+		}
+
+		err = os.WriteFile(filepath.Join(c.Location, "network-config"), []byte(network), 0644)
+		if err != nil {
+			return errors.New("unable to create network-config file: " + err.Error())
+		}
+
+		//mkisofs -output "$vmdir/cidata.iso" -volid cidata -joliet -rock "$vmdir"/{user-data,meta-data,network-config}
+		// mkisofs -output "$vmdir/cidata.iso" -volid cidata -joliet -rock "$vmdir"/{user-data,meta-data,network-config}
+
+		args := []string{"-output", filepath.Join(c.Location, "cidata.iso"), "-volid", "cidata", "-joliet", "-rock", filepath.Join(c.Location, "user-data"), filepath.Join(c.Location, "meta-data"), filepath.Join(c.Location, "network-config")}
+		cmd := exec.Command("mkisofs", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		fmt.Println("Creating cloud-init iso: ", strings.Join(args, " "))
+		err = cmd.Run()
+		if err != nil {
+			return errors.New("unable to create cloud-init iso: " + err.Error())
+		}
+
+		c.ISO = filepath.Join(c.Location, "cidata.iso")
 	}
 
 	err = c.Start()

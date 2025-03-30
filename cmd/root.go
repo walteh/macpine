@@ -43,4 +43,5 @@ func init() {
 	MacpineCmd.AddCommand(shellCmd)
 	MacpineCmd.AddCommand(completionCmd)
 	MacpineCmd.AddCommand(tagCmd)
+	MacpineCmd.AddCommand(launchCloudCmd)
 }

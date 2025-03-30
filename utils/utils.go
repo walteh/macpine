@@ -318,6 +318,17 @@ func GetImageURL(version string) string {
 	return url
 }
 
+func GetImageURLCloud(version string) string {
+	// versmap := map[string]string{
+	// 	"nocloud_alpine-3.21.2-aarch64-uefi-cloudinit-r0.qcow2": "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.2-aarch64-uefi-cloudinit-r0.qcow2",
+	// 	"nocloud_alpine-3.21.2-x86_64-bios-cloudinit-r0.qcow2":  "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.2-x86_64-bios-cloudinit-r0.qcow2",
+	// }
+	// url := versmap[version]
+	// return url
+
+	return "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud/" + version
+}
+
 func DirExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
